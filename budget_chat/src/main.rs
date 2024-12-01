@@ -1,6 +1,5 @@
 mod chat;
 use chat::{budget_chat::BudgetChat, chat_member::ChatMember};
-
 use std::{
     env,
     net::{TcpListener, TcpStream},
@@ -77,15 +76,7 @@ fn handle_connection(stream: TcpStream, mut budget_chat: BudgetChat) {
     let user_name = chat_member.name.clone();
 
     // Add the new member to the budget chat
-    println!(
-        "{} - INFO - Adding newly registered member to chat data structure...",
-        session_id
-    );
     budget_chat.add_new_member(chat_member, &session_id);
-    println!(
-        "{} - INFO - Added newly registered member to chat data structure!",
-        session_id
-    );
 
     // Send current membership to the new user
     let member_names = budget_chat.get_current_member_names(&session_id);
