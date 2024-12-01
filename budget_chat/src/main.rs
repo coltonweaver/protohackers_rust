@@ -1,21 +1,12 @@
-use parking_lot::{Mutex, MutexGuard};
+mod chat;
+use chat::{budget_chat::BudgetChat, chat_member::ChatMember};
+
 use std::{
     env,
-    io::{BufRead, BufReader, Error, Write},
     net::{TcpListener, TcpStream},
-    sync::Arc,
     thread,
 };
 use uuid::Uuid;
-
-struct ChatMember {
-    name: String,
-    source_stream: TcpStream,
-}
-
-struct BudgetChat {
-    chat_members: Vec<ChatMember>,
-}
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -30,10 +21,9 @@ fn main() {
 }
 
 fn serve(listener: TcpListener) {
-    // Create an Arc with an inner Mutex around the BudgetChat data structure that powers the problem.
-    let budget_chat: Arc<Mutex<BudgetChat>> = Arc::new(Mutex::new(BudgetChat {
-        chat_members: Vec::new(),
-    }));
+    // BudgetChat encapsulates an Arc + Mutex that powers handling multiple
+    // connections on different threads
+    let budget_chat = BudgetChat::new();
 
     // We'll track the threads we've spawned here.
     let mut thread_handles = Vec::new();
@@ -65,108 +55,75 @@ fn serve(listener: TcpListener) {
     println!("INFO - Server terminating...");
 }
 
-fn handle_connection(mut stream: TcpStream, budget_chat: Arc<Mutex<BudgetChat>>) {
-    // Define a unique session ID for logging purposes
+fn handle_connection(stream: TcpStream, mut budget_chat: BudgetChat) {
+    // Define a unique session ID for logging and identification purposes
     let session_id = Uuid::new_v4().to_string();
 
     println!("{} - INFO - Opened a new session", session_id);
 
-    let chat_member = register_new_chat_member(&mut stream, &session_id);
-
-    if chat_member.is_none() {
+    // Handle registration for the new member
+    let register_result = ChatMember::register_new_member(stream, session_id.clone());
+    if register_result.is_err() {
+        println!(
+            "{} - ERROR - Failed to register new member with {:?}",
+            session_id,
+            register_result.err()
+        );
         return;
     }
 
-    let chat_member = chat_member.unwrap();
+    // Unwrap the chat_member and save a reference to the name
+    let chat_member = register_result.unwrap();
     let user_name = chat_member.name.clone();
 
-    // Create a scope that represents new user registration. We'll take a lock
-    // on the budget_chat so that we can register the new chat_member and broadcast
-    // all necessary messages.
-    {
-        // Lock the budget_chat so we can register the new ChatMember and broadcast messages
-        let mut budget_chat = budget_chat.lock();
+    // Add the new member to the budget chat
+    println!(
+        "{} - INFO - Adding newly registered member to chat data structure...",
+        session_id
+    );
+    budget_chat.add_new_member(chat_member, &session_id);
+    println!(
+        "{} - INFO - Added newly registered member to chat data structure!",
+        session_id
+    );
 
-        // Now register the newly created ChatMember with the other members in BudgetChat
-        budget_chat.chat_members.push(chat_member);
+    // Send current membership to the new user
+    let member_names = budget_chat.get_current_member_names(&session_id);
+    let result = budget_chat.send_message_to_session(
+        &session_id,
+        &room_membership_message_builder(&user_name, member_names),
+    );
 
-        // Write the room membership to the person who joined
-        let result = send_message_to_current_user(
-            &room_membership_message_builder(&user_name, &budget_chat.chat_members),
-            &user_name,
-            &mut budget_chat,
-            &session_id,
-        );
+    // If the result was already an error, we should terminate this connection
+    if result.is_err() {
+        // We can remove the last entry in the vector since we just pushed it and still hold the lock. This
+        // way we don't try to broadcast a message to this client going forward as well
+        budget_chat.remove_user_from_chat(&session_id);
 
-        // If the result was already an error, we should terminate this connection
-        if result.is_err() {
-            // We can remove the last entry in the vector since we just pushed it and still hold the lock. This
-            // way we don't try to broadcast a message to this client going forward as well
-            let last_idx = budget_chat.chat_members.len() - 1;
-            budget_chat.chat_members.remove(last_idx);
+        // Terminate the connection!
+        return;
+    }
 
-            // Terminate the connection!
-            return;
-        }
-
-        // Broadcast the new user to the other chat members. We specifically do this after confirming that we sent
-        // the room membership to this user.
-        broadcast_message_to_other_users(
-            &user_joined_message_builder(&user_name),
-            &user_name,
-            &mut budget_chat,
-            &session_id,
-        );
-    };
-
-    // Let's create a single BufReader to re-use across iterations
-    let mut response_buffer = BufReader::new(&stream);
+    // Broadcast the new user to the other chat members. We specifically do this after confirming that we sent
+    // the room membership to this user.
+    budget_chat.broadcast_message_to_chat(&session_id, &user_joined_message_builder(&user_name));
 
     // Now we can listen for messages from the client and broadcast them to other users
     loop {
         // Read until newline
-        let mut message = String::new();
-        let read_result = response_buffer.read_line(&mut message);
-        let message = message.trim();
+        let message_result = budget_chat.read_message_from_session(&session_id);
 
-        let mut budget_chat = budget_chat.lock();
-
-        // If there was an error reading the message, terminate the connection and remove the
-        // current user from the list.
-        if read_result.is_err() {
-            println!(
-                "{} - ERROR - Received an error reading message from {}: {:?}",
-                session_id,
-                user_name,
-                read_result.err()
-            );
-
-            // Remove user and terminate connection
-            remove_user_from_chat(&user_name, &mut budget_chat, &session_id);
+        if message_result.is_err() {
+            budget_chat.remove_user_from_chat(&session_id);
             break;
         }
 
-        if message.is_empty() {
-            println!(
-                "{} - INFO - Received an empty message from {}, terminating chat for them...",
-                session_id, user_name
-            );
-
-            remove_user_from_chat(&user_name, &mut budget_chat, &session_id);
-            break;
-        }
-
-        // If either the chat room is empty no need to try and broadcast
-        if budget_chat.chat_members.is_empty() {
-            continue;
-        }
+        let message = message_result.unwrap();
 
         // Now broadcast this message to the rest of the clients
-        broadcast_message_to_other_users(
-            &user_chat_message_builder(&user_name, message.to_string()),
-            &user_name,
-            &mut budget_chat,
+        budget_chat.broadcast_message_to_chat(
             &session_id,
+            &user_chat_message_builder(&user_name, message.to_string()),
         );
     }
 
@@ -174,191 +131,6 @@ fn handle_connection(mut stream: TcpStream, budget_chat: Arc<Mutex<BudgetChat>>)
         "{} - INFO - Terminating connection with chat member {}",
         session_id, user_name
     );
-}
-
-// User Registration Utilities
-
-fn register_new_chat_member(stream: &mut TcpStream, session_id: &String) -> Option<ChatMember> {
-    // Request the name from the new connection. We won't register the new stream until
-    // we've received a valid response so other clients won't be aware of a bad client.
-    let name = match request_name(stream, &session_id) {
-        Some(name) => name,
-        None => {
-            println!(
-                "{} - WARN - Terminating session due to invalid name",
-                session_id
-            );
-            return None;
-        }
-    };
-
-    println!(
-        "{} - INFO - Received name from client: {}",
-        session_id, &name
-    );
-
-    // Create a ChatMember struct with the new name and move ownership of the TcpStream into it.
-    let chat_member = ChatMember {
-        name: name.clone(),
-        source_stream: stream.try_clone().unwrap(),
-    };
-
-    Some(chat_member)
-}
-
-fn request_name(stream: &mut TcpStream, session_id: &String) -> Option<String> {
-    println!(
-        "{} - INFO - Requesting name for newly connected session {:?}",
-        session_id, stream
-    );
-
-    // Send a constant string requesting the name of the new client
-    let request_result =
-        stream.write_all("Welcome to budgetchat! What shall I call you?\n".as_bytes());
-    if request_result.is_err() {
-        println!(
-            "{} - ERROR - Failed to write name with error: {:?}",
-            session_id,
-            request_result.err()
-        );
-        return None;
-    }
-
-    // Responses are all individual strings terminated with a newline, so we'll use
-    // a BufReader to access the `read_line` method.
-    let mut response_buffer = BufReader::new(stream);
-    let mut name = String::new();
-    let result = response_buffer.read_line(&mut name);
-    if result.is_err() {
-        println!(
-            "{} - ERROR - Received an error reading name response: {:?}",
-            session_id,
-            result.err()
-        );
-        return None;
-    }
-
-    if name.is_empty() {
-        println!(
-            "{} - ERROR - Received an empty name from the client...",
-            session_id
-        );
-        return None;
-    }
-
-    // Trim any newlines off of the string
-    let name = name.trim();
-
-    // There's prob a better way to do this but w/e
-    // Scan for any non-alphanumeric characters in the given name
-    for c in name.chars() {
-        if !c.is_alphanumeric() {
-            println!(
-                "{} - ERROR - Received a name with non-alphanumeric characters: {}",
-                session_id, name
-            );
-            return None;
-        }
-    }
-
-    Some(name.to_string())
-}
-
-// Message Sending Utilities
-
-fn broadcast_message_to_other_users(
-    message: &String,
-    current_user_name: &String,
-    budget_chat: &mut MutexGuard<'_, BudgetChat>,
-    session_id: &String,
-) {
-    println!(
-        "{} - INFO - Broadcasting message to all clients except {}: {}",
-        session_id, current_user_name, message
-    );
-
-    // We'll use a scope to define a critical section for the app
-    {
-        let chat_members = &mut budget_chat.chat_members;
-
-        for (_, other) in chat_members.iter_mut().enumerate() {
-            if other.name == *current_user_name {
-                // Skip broadcasting messages to current user
-                continue;
-            }
-
-            // Write the message to the chat_member's TcpStream, returning the `Result<usize>`
-            let result = other
-                .source_stream
-                .write_all(format!("{}\n", message).as_bytes());
-
-            if result.is_err() {
-                println!(
-                    "{} - ERROR - Failed to broadcast message to {}: {:?}",
-                    session_id,
-                    other.name,
-                    result.err()
-                );
-            }
-        }
-    }
-}
-
-fn send_message_to_current_user(
-    message: &String,
-    name: &String,
-    budget_chat: &mut MutexGuard<'_, BudgetChat>,
-    session_id: &String,
-) -> Result<(), Error> {
-    println!(
-        "{} - INFO - Sending message to {}: {}",
-        session_id, name, message
-    );
-
-    // Find a mutable reference to the current chat member.
-    if let Some(chat_member) = budget_chat
-        .chat_members
-        .iter_mut()
-        .find(|member| member.name == *name)
-    {
-        // Write the message to the chat_member's TcpStream, returning the `Result`
-        let result = chat_member
-            .source_stream
-            .write_all(format!("{}\n", message).as_bytes());
-
-        result
-    } else {
-        panic!("Could not find current user!");
-    }
-}
-
-// Membership Removal Utility
-
-fn remove_user_from_chat(
-    name: &String,
-    budget_chat: &mut MutexGuard<'_, BudgetChat>,
-    session_id: &String,
-) {
-    if let Some(idx) = budget_chat
-        .chat_members
-        .iter()
-        .position(|member| member.name == *name)
-    {
-        // Pop the member out of the list and explicitly drop it to terminate
-        // the connection now.
-        let member = budget_chat.chat_members.remove(idx);
-        drop(member);
-
-        // Let the other users know the user has left
-        broadcast_message_to_other_users(
-            &format!("* {} has left the room", name),
-            name,
-            budget_chat,
-            session_id,
-        );
-    } else {
-        panic!("{} - ERROR - Can't find given member!", session_id);
-    }
 }
 
 // Message Builder Utilities
@@ -369,12 +141,13 @@ fn user_joined_message_builder(name: &String) -> String {
 
 fn room_membership_message_builder(
     current_user_name: &String,
-    chat_members: &Vec<ChatMember>,
+    chat_member_names: Vec<String>,
 ) -> String {
-    let names = chat_members
+    // Get current members, filter out the current user, and
+    let names = chat_member_names
         .iter()
-        .map(|member| member.name.clone())
-        .filter(|name| name != current_user_name)
+        .filter(|name| *name != current_user_name)
+        .cloned()
         .collect::<Vec<_>>()
         .join(", ");
 
